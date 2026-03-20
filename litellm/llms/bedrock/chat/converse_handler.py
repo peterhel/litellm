@@ -1,5 +1,5 @@
 import json
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import httpx
 
@@ -35,7 +35,7 @@ def make_sync_call(
     stream_chunk_size: int = 1024,
 ):
     if client is None:
-        client = _get_httpx_client()  # Create a new client if none provided
+        client = _get_httpx_client()
 
     response = client.post(
         api_base,
@@ -51,9 +51,7 @@ def make_sync_call(
         )
 
     if fake_stream:
-        model_response: (
-            ModelResponse
-        ) = litellm.AmazonConverseConfig()._transform_response(
+        model_response = litellm.AmazonConverseConfig()._transform_response(
             model=model,
             response=response,
             model_response=litellm.ModelResponse(),
@@ -64,7 +62,7 @@ def make_sync_call(
             data=data,
             messages=messages,
             encoding=litellm.encoding,
-        )  # type: ignore
+        )
         completion_stream: Any = MockResponseIterator(
             model_response=model_response, json_mode=json_mode
         )
@@ -74,7 +72,6 @@ def make_sync_call(
             response.iter_bytes(chunk_size=stream_chunk_size)
         )
 
-    # LOGGING
     logging_obj.post_call(
         input=messages,
         api_key="",
@@ -88,6 +85,48 @@ def make_sync_call(
 class BedrockConverseLLM(BaseAWSLLM):
     def __init__(self) -> None:
         super().__init__()
+
+    def _scrub_converse_request(self, request_data: dict):
+        """
+        Final pass to ensure no 'text' fields in the Converse API payload are empty.
+        Bedrock will reject the entire request if any block has blank text.
+        """
+        def clean_block(block):
+            if isinstance(block, dict) and "text" in block:
+                # If text is empty or just whitespace, use a single space
+                if not block["text"] or not str(block["text"]).strip():
+                    block["text"] = " "
+            return block
+
+        if "messages" in request_data:
+            for msg in request_data["messages"]:
+                if "content" in msg:
+                    if isinstance(msg["content"], list):
+                        msg["content"] = [clean_block(b) for b in msg["content"]]
+                    elif isinstance(msg["content"], str) and not msg["content"].strip():
+                        msg["content"] = " "
+
+        if "system" in request_data:
+            if isinstance(request_data["system"], list):
+                request_data["system"] = [clean_block(b) for b in request_data["system"]]
+
+        return request_data
+
+    def _clean_messages(self, messages: list):
+        if not messages or not isinstance(messages, list):
+            return messages
+
+        for msg in messages:
+            content = msg.get("content")
+            if content:
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and "text" in block:
+                            if not block["text"] or not str(block["text"]).strip():
+                                block["text"] = " "
+                elif isinstance(content, str) and not content.strip():
+                    msg["content"] = " "
+        return messages
 
     async def async_streaming(
         self,
@@ -110,6 +149,8 @@ class BedrockConverseLLM(BaseAWSLLM):
         api_key: Optional[str] = None,
         stream_chunk_size: int = 1024,
     ) -> CustomStreamWrapper:
+        messages = self._clean_messages(messages)
+
         request_data = await litellm.AmazonConverseConfig()._async_transform_request(
             model=model,
             messages=messages,
@@ -117,6 +158,8 @@ class BedrockConverseLLM(BaseAWSLLM):
             litellm_params=litellm_params,
             headers=headers,
         )
+
+        request_data = self._scrub_converse_request(request_data)
         data = json.dumps(request_data)
 
         prepped = self.get_request_headers(
@@ -129,7 +172,6 @@ class BedrockConverseLLM(BaseAWSLLM):
             api_key=api_key,
         )
 
-        ## LOGGING
         logging_obj.pre_call(
             input=messages,
             api_key="",
@@ -158,6 +200,7 @@ class BedrockConverseLLM(BaseAWSLLM):
             custom_llm_provider="bedrock",
             logging_obj=logging_obj,
         )
+
         return streaming_response
 
     async def async_completion(
@@ -178,6 +221,8 @@ class BedrockConverseLLM(BaseAWSLLM):
         client: Optional[AsyncHTTPHandler] = None,
         api_key: Optional[str] = None,
     ) -> Union[ModelResponse, CustomStreamWrapper]:
+        messages = self._clean_messages(messages)
+
         request_data = await litellm.AmazonConverseConfig()._async_transform_request(
             model=model,
             messages=messages,
@@ -185,6 +230,8 @@ class BedrockConverseLLM(BaseAWSLLM):
             litellm_params=litellm_params,
             headers=headers,
         )
+
+        request_data = self._scrub_converse_request(request_data)
         data = json.dumps(request_data)
 
         prepped = self.get_request_headers(
@@ -197,7 +244,6 @@ class BedrockConverseLLM(BaseAWSLLM):
             api_key=api_key,
         )
 
-        ## LOGGING
         logging_obj.pre_call(
             input=messages,
             api_key="",
@@ -218,8 +264,6 @@ class BedrockConverseLLM(BaseAWSLLM):
             client = get_async_httpx_client(
                 params=_params, llm_provider=litellm.LlmProviders.BEDROCK
             )
-        else:
-            client = client  # type: ignore
 
         try:
             response = await client.post(
@@ -227,7 +271,7 @@ class BedrockConverseLLM(BaseAWSLLM):
                 headers=headers,
                 data=data,
                 logging_obj=logging_obj,
-            )  # type: ignore
+            )
             response.raise_for_status()
         except httpx.HTTPStatusError as err:
             error_code = err.response.status_code
@@ -248,7 +292,7 @@ class BedrockConverseLLM(BaseAWSLLM):
             encoding=encoding,
         )
 
-    def completion(  # noqa: PLR0915
+    def completion(
         self,
         model: str,
         messages: list,
@@ -266,165 +310,125 @@ class BedrockConverseLLM(BaseAWSLLM):
         client: Optional[Union[AsyncHTTPHandler, HTTPHandler]] = None,
         api_key: Optional[str] = None,
     ):
-        ## SETUP ##
+        messages = self._clean_messages(messages)
+
         stream = optional_params.pop("stream", None)
         stream_chunk_size = optional_params.pop("stream_chunk_size", 1024)
         unencoded_model_id = optional_params.pop("model_id", None)
         fake_stream = optional_params.pop("fake_stream", False)
         json_mode = optional_params.get("json_mode", False)
+
         if unencoded_model_id is not None:
             modelId = self.encode_model_id(model_id=unencoded_model_id)
         else:
-            # Strip nova spec prefixes before encoding model ID for API URL
             _model_for_id = model
             _stripped = _model_for_id
             for rp in ["bedrock/converse/", "bedrock/", "converse/"]:
                 if _stripped.startswith(rp):
                     _stripped = _stripped[len(rp) :]
                     break
-            # Strip embedded region prefix (e.g. "bedrock/us-east-1/model" -> "model")
-            # and capture it so it can be used as aws_region_name below.
+
             _region_from_model: Optional[str] = None
             _potential_region = _stripped.split("/", 1)[0]
             if _potential_region in _get_all_bedrock_regions() and "/" in _stripped:
                 _region_from_model = _potential_region
                 _stripped = _stripped.split("/", 1)[1]
                 _model_for_id = _stripped
-            for _nova_prefix in ["nova-2/", "nova/"]:
-                if _stripped.startswith(_nova_prefix):
-                    _model_for_id = _model_for_id.replace(_nova_prefix, "", 1)
-                    break
+
             modelId = self.encode_model_id(model_id=_model_for_id)
-            # Inject region extracted from model path so _get_aws_region_name picks it up
             if (
                 _region_from_model is not None
                 and "aws_region_name" not in optional_params
             ):
                 optional_params["aws_region_name"] = _region_from_model
 
-        fake_stream = litellm.AmazonConverseConfig().should_fake_stream(
-            fake_stream=fake_stream,
-            model=model,
-            stream=stream,
-            custom_llm_provider="bedrock",
-        )
-
-        ### SET REGION NAME ###
         aws_region_name = self._get_aws_region_name(
-            optional_params=optional_params,
-            model=model,
-            model_id=unencoded_model_id,
+            optional_params=optional_params, model=model, model_id=unencoded_model_id
         )
-
-        ## CREDENTIALS ##
-        # pop aws_secret_access_key, aws_access_key_id, aws_region_name from kwargs, since completion calls fail with them
-        aws_secret_access_key = optional_params.pop("aws_secret_access_key", None)
-        aws_access_key_id = optional_params.pop("aws_access_key_id", None)
-        aws_session_token = optional_params.pop("aws_session_token", None)
-        aws_role_name = optional_params.pop("aws_role_name", None)
-        aws_session_name = optional_params.pop("aws_session_name", None)
-        aws_profile_name = optional_params.pop("aws_profile_name", None)
-        aws_bedrock_runtime_endpoint = optional_params.pop(
-            "aws_bedrock_runtime_endpoint", None
-        )  # https://bedrock-runtime.{region_name}.amazonaws.com
-        aws_web_identity_token = optional_params.pop("aws_web_identity_token", None)
-        aws_sts_endpoint = optional_params.pop("aws_sts_endpoint", None)
-        aws_external_id = optional_params.pop("aws_external_id", None)
-        optional_params.pop("aws_region_name", None)
-
-        litellm_params[
-            "aws_region_name"
-        ] = aws_region_name  # [DO NOT DELETE] important for async calls
 
         credentials: Credentials = self.get_credentials(
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            aws_session_token=aws_session_token,
+            aws_access_key_id=optional_params.pop("aws_access_key_id", None),
+            aws_secret_access_key=optional_params.pop("aws_secret_access_key", None),
+            aws_session_token=optional_params.pop("aws_session_token", None),
             aws_region_name=aws_region_name,
-            aws_session_name=aws_session_name,
-            aws_profile_name=aws_profile_name,
-            aws_role_name=aws_role_name,
-            aws_web_identity_token=aws_web_identity_token,
-            aws_sts_endpoint=aws_sts_endpoint,
-            aws_external_id=aws_external_id,
+            aws_session_name=optional_params.pop("aws_session_name", None),
+            aws_profile_name=optional_params.pop("aws_profile_name", None),
+            aws_role_name=optional_params.pop("aws_role_name", None),
+            aws_web_identity_token=optional_params.pop("aws_web_identity_token", None),
+            aws_sts_endpoint=optional_params.pop("aws_sts_endpoint", None),
+            aws_external_id=optional_params.pop("aws_external_id", None),
         )
+        litellm_params["aws_region_name"] = aws_region_name
 
-        ### SET RUNTIME ENDPOINT ###
         endpoint_url, proxy_endpoint_url = self.get_runtime_endpoint(
             api_base=api_base,
-            aws_bedrock_runtime_endpoint=aws_bedrock_runtime_endpoint,
+            aws_bedrock_runtime_endpoint=optional_params.pop(
+                "aws_bedrock_runtime_endpoint", None
+            ),
             aws_region_name=aws_region_name,
         )
-        if (stream is not None and stream is True) and not fake_stream:
-            endpoint_url = f"{endpoint_url}/model/{modelId}/converse-stream"
+
+        if stream is True and not fake_stream:
             proxy_endpoint_url = f"{proxy_endpoint_url}/model/{modelId}/converse-stream"
         else:
-            endpoint_url = f"{endpoint_url}/model/{modelId}/converse"
             proxy_endpoint_url = f"{proxy_endpoint_url}/model/{modelId}/converse"
 
-        ## COMPLETION CALL
-        headers = {"Content-Type": "application/json"}
-        if extra_headers is not None:
-            headers = {"Content-Type": "application/json", **extra_headers}
-
-        # Filter beta headers in HTTP headers before making the request
         headers = update_headers_with_filtered_beta(
-            headers=headers, provider="bedrock_converse"
+            headers={"Content-Type": "application/json", **(extra_headers or {})},
+            provider="bedrock_converse",
         )
-        ### ROUTING (ASYNC, STREAMING, SYNC)
+
         if acompletion:
-            if isinstance(client, HTTPHandler):
-                client = None
             if stream is True:
                 return self.async_streaming(
                     model=model,
                     messages=messages,
                     api_base=proxy_endpoint_url,
                     model_response=model_response,
+                    timeout=timeout,
                     encoding=encoding,
                     logging_obj=logging_obj,
+                    stream=stream,
                     optional_params=optional_params,
-                    stream=True,
                     litellm_params=litellm_params,
+                    credentials=credentials,
                     logger_fn=logger_fn,
                     headers=headers,
-                    timeout=timeout,
-                    client=client,
-                    json_mode=json_mode,
+                    client=cast(Optional[AsyncHTTPHandler], client),
                     fake_stream=fake_stream,
-                    credentials=credentials,
+                    json_mode=json_mode,
                     api_key=api_key,
                     stream_chunk_size=stream_chunk_size,
-                )  # type: ignore
-            ### ASYNC COMPLETION
-            return self.async_completion(
-                model=model,
-                messages=messages,
-                api_base=proxy_endpoint_url,
-                model_response=model_response,
-                encoding=encoding,
-                logging_obj=logging_obj,
-                optional_params=optional_params,
-                stream=stream,  # type: ignore
-                litellm_params=litellm_params,
-                logger_fn=logger_fn,
-                headers=headers,
-                timeout=timeout,
-                client=client,
-                credentials=credentials,
-                api_key=api_key,
-            )  # type: ignore
+                )
+            else:
+                return self.async_completion(
+                    model=model,
+                    messages=messages,
+                    api_base=proxy_endpoint_url,
+                    model_response=model_response,
+                    timeout=timeout,
+                    encoding=encoding,
+                    logging_obj=logging_obj,
+                    stream=stream,
+                    optional_params=optional_params,
+                    litellm_params=litellm_params,
+                    credentials=credentials,
+                    logger_fn=logger_fn,
+                    headers=headers,
+                    client=cast(Optional[AsyncHTTPHandler], client),
+                    api_key=api_key,
+                )
 
-        ## TRANSFORMATION ##
-
-        _data = litellm.AmazonConverseConfig()._transform_request(
+        _request_data = litellm.AmazonConverseConfig()._transform_request(
             model=model,
             messages=messages,
             optional_params=optional_params,
             litellm_params=litellm_params,
             headers=extra_headers,
         )
-        data = json.dumps(_data)
+
+        _request_data = self._scrub_converse_request(_request_data)
+        data = json.dumps(_request_data)
 
         prepped = self.get_request_headers(
             credentials=credentials,
@@ -436,35 +440,21 @@ class BedrockConverseLLM(BaseAWSLLM):
             api_key=api_key,
         )
 
-        ## LOGGING
         logging_obj.pre_call(
             input=messages,
             api_key="",
             additional_args={
                 "complete_input_dict": data,
                 "api_base": proxy_endpoint_url,
-                "headers": prepped.headers,
+                "headers": dict(prepped.headers),
             },
         )
-        if client is None or isinstance(client, AsyncHTTPHandler):
-            _params = {}
-            if timeout is not None:
-                if isinstance(timeout, float) or isinstance(timeout, int):
-                    timeout = httpx.Timeout(timeout)
-                _params["timeout"] = timeout
-            client = _get_httpx_client(_params)  # type: ignore
-        else:
-            client = client
 
-        if stream is not None and stream is True:
+        if stream is True:
             completion_stream = make_sync_call(
-                client=(
-                    client
-                    if client is not None and isinstance(client, HTTPHandler)
-                    else None
-                ),
+                client=cast(Optional[HTTPHandler], client),
                 api_base=proxy_endpoint_url,
-                headers=prepped.headers,  # type: ignore
+                headers=dict(prepped.headers),
                 data=data,
                 model=model,
                 messages=messages,
@@ -479,18 +469,15 @@ class BedrockConverseLLM(BaseAWSLLM):
                 custom_llm_provider="bedrock",
                 logging_obj=logging_obj,
             )
-
             return streaming_response
 
-        ### COMPLETION
-
         try:
-            response = client.post(
+            response = (client or _get_httpx_client()).post(
                 url=proxy_endpoint_url,
                 headers=prepped.headers,
                 data=data,
                 logging_obj=logging_obj,
-            )  # type: ignore
+            )
             response.raise_for_status()
         except httpx.HTTPStatusError as err:
             error_code = err.response.status_code
